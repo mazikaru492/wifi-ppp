@@ -1,0 +1,8 @@
+Pythonがインストール済みの前提で、以下をコマンドプロンプト or PowerShell で実行してください：
+
+各パッケージの役割
+パッケージ	用途
+pywifi	Wi-Fiスキャン機能
+comtypes	pywifiの依存（Windows COM操作）
+pandas	データ整理
+matplotlib	グラフ描画
