@@ -28,6 +28,11 @@ class WifiAnalyzerApp:
         self.current_results = []
         self.current_ssid = ""
 
+        # データ保持（Persistence）機能: キャッシュとTTL設定
+        # キー: "SSID_チャンネル", 値: {"signal": 信号強度, "last_seen": 最終検出時刻, "ssid": SSID, "channel": チャンネル, "band": 周波数帯}
+        self.wifi_cache = {}
+        self.cache_ttl = 10  # データ保持期間（秒）
+
         self.info_frame = ttk.Frame(root, padding=5, relief="groove")
         self.info_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         self.info_label = ttk.Label(self.info_frame, text="接続情報取得中...", font=("MS Gothic", 12, "bold"))
@@ -142,8 +147,33 @@ class WifiAnalyzerApp:
             self.start_manual_scan()
 
     def refresh_graph_only(self):
-        if self.current_results:
-            self.process_results(self.current_results)
+        """周波数帯切り替え時にキャッシュデータからグラフを再描画"""
+        # 生データ(current_results)ではなく、キャッシュから直接描画
+        # これにより、帯域切り替え時もキャッシュが維持される
+        current_time = time.time()
+        target_band = self.band_var.get()
+
+        # 期限切れデータを削除
+        expired_keys = [
+            key for key, value in self.wifi_cache.items()
+            if current_time - value["last_seen"] > self.cache_ttl
+        ]
+        for key in expired_keys:
+            del self.wifi_cache[key]
+
+        # キャッシュから対象帯域のデータを抽出
+        data = []
+        for key, value in self.wifi_cache.items():
+            if value["band"] == target_band:
+                data.append({
+                    "channel": value["channel"],
+                    "signal": value["signal"],
+                    "ssid": value["ssid"],
+                    "band": value["band"]
+                })
+
+        df = pd.DataFrame(data)
+        self.update_graph(df, target_band)
 
     def scan_process(self):
         if pythoncom:
@@ -178,29 +208,61 @@ class WifiAnalyzerApp:
                 threading.Thread(target=self.scan_process, daemon=True).start()
 
     def process_results(self, results):
+        """スキャン結果をキャッシュにマージし、期限切れデータを削除後、グラフを更新"""
+        current_time = time.time()
+
+        # ステップ1: スキャン結果をキャッシュに更新（両帯域とも処理）
+        for network in results:
+            ssid = getattr(network, "ssid", "")
+            if not ssid:
+                continue
+
+            freq_val = getattr(network, "freq", None) or getattr(network, "frequency", None)
+            signal = getattr(network, "signal", -100)
+            channel, band = self.frequency_to_channel(freq_val)
+
+            if channel is None or band is None:
+                continue
+
+            key = f"{ssid}_{channel}"
+            self.wifi_cache[key] = {
+                "signal": signal,
+                "last_seen": current_time,
+                "ssid": ssid,
+                "channel": channel,
+                "band": band
+            }
+
+        # ステップ2: 期限切れデータ（TTL超過）をキャッシュから削除
+        expired_keys = [
+            key for key, value in self.wifi_cache.items()
+            if current_time - value["last_seen"] > self.cache_ttl
+        ]
+        for key in expired_keys:
+            del self.wifi_cache[key]
+
+        # ステップ3: 現在の表示対象帯域でフィルタリング
         target_band = self.band_var.get()
         data = []
         unique_check = set()
 
-        for network in results:
-            ssid = getattr(network, "ssid", "")
-            if not ssid: continue
-
-            freq_val = getattr(network, "freq", None) or getattr(network, "frequency", None)
-            signal = getattr(network, "signal", -100)
-
-            channel, band = self.frequency_to_channel(freq_val)
-
-            if band != target_band or channel is None:
+        for key, value in self.wifi_cache.items():
+            if value["band"] != target_band:
                 continue
 
-            key = f"{ssid}_{channel}"
-            if key in unique_check: continue
+            # 重複チェック（同じSSID+チャンネルの組み合わせ）
+            if key in unique_check:
+                continue
             unique_check.add(key)
 
-            data.append({"channel": channel, "signal": signal, "ssid": ssid, "band": band})
+            data.append({
+                "channel": value["channel"],
+                "signal": value["signal"],
+                "ssid": value["ssid"],
+                "band": value["band"]
+            })
 
-        print(f"{target_band}帯の有効データ: {len(data)} 件")
+        print(f"{target_band}帯の有効データ: {len(data)} 件（キャッシュ総数: {len(self.wifi_cache)}）")
         df = pd.DataFrame(data)
         self.root.after(0, lambda: self.update_graph(df, target_band))
 
@@ -223,6 +285,7 @@ class WifiAnalyzerApp:
         return y_vals
 
     def update_graph(self, df, band):
+        """キャッシュから作成したDataFrameでグラフを更新（スマートラベル配置対応）"""
         # ★白背景設定
         plt.style.use("default")
         plt.rcParams['font.family'] = 'MS Gothic'
@@ -247,8 +310,16 @@ class WifiAnalyzerApp:
         connected_ssid = (self.current_ssid or "").strip()
         colors = plt.cm.tab10.colors
 
-        if not df.empty:
-            df = df.sort_values(by="signal", ascending=True)
+        # ★チャンネル順（昇順）でソート - ラベル重なり回避のため
+        df = df.sort_values(by=["channel", "signal"], ascending=[True, False]).reset_index(drop=True)
+
+        # ★描画済みラベル位置を記録（重なり回避用）
+        label_positions = []  # [(x, y), ...]
+
+        # ラベル重なり判定のしきい値
+        ch_threshold = 2 if band == "2.4GHz" else 8  # チャンネル近接しきい値
+        signal_threshold = 10  # 信号強度近接しきい値 (dBm)
+        y_offset_step = 8  # Y方向オフセット量 (dBm)
 
         for idx, row in df.iterrows():
             is_connected = (row["ssid"] == connected_ssid)
@@ -264,17 +335,40 @@ class WifiAnalyzerApp:
             self.ax.fill_between(x_axis, y_curve, -100, color=color, alpha=0.3, zorder=z)
             self.ax.plot(x_axis, y_curve, color=color, linewidth=2.5 if is_connected else 1.5, zorder=z+1)
 
-            font_weight = "bold" if is_connected else "normal"
-            font_size = 11 if is_connected else 9
+            # ★スマートラベル配置: Y座標オフセット計算
+            base_x = row["channel"]
+            base_y = row["signal"] + 2
+            final_y = base_y
 
-            self.ax.text(row["channel"], row["signal"] + 2, row["ssid"],
+            # 既存ラベルとの重なりをチェックし、必要に応じてオフセット
+            offset_count = 0
+            for prev_x, prev_y in label_positions:
+                ch_diff = abs(base_x - prev_x)
+                y_diff = abs(final_y - prev_y)
+
+                # チャンネルが近く、かつY座標も近い場合はオフセット
+                if ch_diff <= ch_threshold and y_diff < y_offset_step:
+                    offset_count += 1
+                    final_y = base_y + (offset_count * y_offset_step)
+
+            # Y座標が上限を超えないように制限
+            final_y = min(final_y, -22)
+
+            # 描画位置を記録
+            label_positions.append((base_x, final_y))
+
+            # ★フォントサイズを小さく、背景の透明度を上げて読みやすく
+            font_weight = "bold" if is_connected else "normal"
+            font_size = 9 if is_connected else 8  # 小さめに変更
+
+            self.ax.text(base_x, final_y, row["ssid"],
                          color="black",
                          fontsize=font_size,
                          fontweight=font_weight,
                          ha="center", va="bottom",
                          zorder=z+5,
                          rotation=0,
-                         bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+                         bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85))
 
         if band == "2.4GHz":
             self.ax.set_xticks(range(1, 15))
